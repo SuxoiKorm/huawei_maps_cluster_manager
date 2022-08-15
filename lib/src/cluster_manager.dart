@@ -1,38 +1,25 @@
-import 'dart:math';
 import 'dart:typed_data';
 import 'dart:ui';
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
-import 'package:google_maps_cluster_manager/google_maps_cluster_manager.dart';
-import 'package:google_maps_cluster_manager/src/max_dist_clustering.dart';
-import 'package:google_maps_flutter_platform_interface/google_maps_flutter_platform_interface.dart';
+import 'package:huawei_map/map.dart';
 
-enum ClusterAlgorithm { GEOHASH, MAX_DIST }
+import 'cluster.dart';
+import 'cluster_item.dart';
 
-class MaxDistParams {
-  final double epsilon;
-
-  MaxDistParams(this.epsilon);
-}
-
-class ClusterManager<T extends ClusterItem> {
+class ClusterManager<T> {
   ClusterManager(this._items, this.updateMarkers,
       {Future<Marker> Function(Cluster<T>)? markerBuilder,
       this.levels = const [1, 4.25, 6.75, 8.25, 11.5, 14.5, 16.0, 16.5, 20.0],
       this.extraPercent = 0.5,
-      this.maxItemsForMaxDistAlgo = 200,
-      this.clusterAlgorithm = ClusterAlgorithm.GEOHASH,
-      this.maxDistParams,
+      this.initialZoom = 5.0,
       this.stopClusteringZoom})
       : this.markerBuilder = markerBuilder ?? _basicMarkerBuilder,
         assert(levels.length <= precision);
 
   /// Method to build markers
   final Future<Marker> Function(Cluster<T>) markerBuilder;
-
-  // Num of Items to switch from MAX_DIST algo to GEOHASH
-  final int maxItemsForMaxDistAlgo;
 
   /// Function to update Markers on Google Map
   final void Function(Set<Marker>) updateMarkers;
@@ -43,10 +30,7 @@ class ClusterManager<T extends ClusterItem> {
   /// Extra percent of markers to be loaded (ex : 0.2 for 20%)
   final double extraPercent;
 
-  // Clusteringalgorithm
-  final ClusterAlgorithm clusterAlgorithm;
-
-  final MaxDistParams? maxDistParams;
+  final double initialZoom;
 
   /// Zoom level to stop cluster rendering
   final double? stopClusteringZoom;
@@ -54,22 +38,20 @@ class ClusterManager<T extends ClusterItem> {
   /// Precision of the geohash
   static final int precision = kIsWeb ? 12 : 20;
 
-  /// Google Maps map id
-  int? _mapId;
+  /// Huawei Maps controller
+  HuaweiMapController? _mapController;
 
   /// List of items
-  Iterable<T> get items => _items;
-  Iterable<T> _items;
+  Iterable<ClusterItem<T>> get items => _items;
+  Iterable<ClusterItem<T>> _items;
 
   /// Last known zoom
-  late double _zoom;
+  double get _currentZoom => _zoom ?? initialZoom;
+  double? _zoom;
 
-  final double _maxLng = 180 - pow(10, -10.0) as double;
-
-  /// Set Google Map Id for the cluster manager
-  void setMapId(int mapId, {bool withUpdate = true}) async {
-    _mapId = mapId;
-    _zoom = await GoogleMapsFlutterPlatform.instance.getZoomLevel(mapId: mapId);
+  /// Set Google Map Controller for the cluster manager
+  void setMapController(HuaweiMapController controller, {bool withUpdate = true}) {
+    _mapController = controller;
     if (withUpdate) updateMap();
   }
 
@@ -81,20 +63,19 @@ class ClusterManager<T extends ClusterItem> {
   void _updateClusters() async {
     List<Cluster<T>> mapMarkers = await getMarkers();
 
-    final Set<Marker> markers =
-        Set.from(await Future.wait(mapMarkers.map((m) => markerBuilder(m))));
+    final Set<Marker> markers = Set.from(await Future.wait(mapMarkers.map((m) => markerBuilder(m))));
 
     updateMarkers(markers);
   }
 
   /// Update all cluster items
-  void setItems(List<T> newItems) {
+  void setItems(List<ClusterItem<T>> newItems) {
     _items = newItems;
     updateMap();
   }
 
   /// Add on cluster item
-  void addItem(ClusterItem newItem) {
+  void addItem(ClusterItem<T> newItem) {
     _items = List.from([...items, newItem]);
     updateMap();
   }
@@ -109,118 +90,68 @@ class ClusterManager<T extends ClusterItem> {
 
   /// Retrieve cluster markers
   Future<List<Cluster<T>>> getMarkers() async {
-    if (_mapId == null) return List.empty();
+    if (_mapController == null) return List.empty();
 
-    final LatLngBounds mapBounds = await GoogleMapsFlutterPlatform.instance
-        .getVisibleRegion(mapId: _mapId!);
+    final LatLngBounds mapBounds = await _mapController!.getVisibleRegion();
+    final LatLngBounds inflatedBounds = _inflateBounds(mapBounds);
 
-    late LatLngBounds inflatedBounds;
-    if (clusterAlgorithm == ClusterAlgorithm.GEOHASH) {
-      inflatedBounds = _inflateBounds(mapBounds);
-    } else {
-      inflatedBounds = mapBounds;
-    }
-
-    List<T> visibleItems = items.where((i) {
+    List<ClusterItem<T>> visibleItems = items.where((i) {
       return inflatedBounds.contains(i.location);
     }).toList();
 
-    if (stopClusteringZoom != null && _zoom >= stopClusteringZoom!)
-      return visibleItems.map((i) => Cluster<T>.fromItems([i])).toList();
+    if (stopClusteringZoom != null && _currentZoom >= stopClusteringZoom!)
+      return visibleItems.map((i) => Cluster<T>([i])).toList();
 
-    if (clusterAlgorithm == ClusterAlgorithm.GEOHASH ||
-        visibleItems.length >= maxItemsForMaxDistAlgo) {
-      int level = _findLevel(levels);
-      List<Cluster<T>> markers = _computeClusters(
-          visibleItems, List.empty(growable: true),
-          level: level);
-      return markers;
-    } else {
-      List<Cluster<T>> markers =
-          _computeClustersWithMaxDist(visibleItems, _zoom);
-      return markers;
-    }
+    int level = _findLevel(levels);
+    List<Cluster<T>> markers = _computeClusters(visibleItems, List.empty(growable: true), level: level);
+    return markers;
   }
 
   LatLngBounds _inflateBounds(LatLngBounds bounds) {
     // Bounds that cross the date line expand compared to their difference with the date line
-    double lng = 0;
-    if (bounds.northeast.longitude < bounds.southwest.longitude) {
-      lng = extraPercent *
-          ((180.0 - bounds.southwest.longitude) +
-              (bounds.northeast.longitude + 180));
+    double lng;
+    if (bounds.northeast.lng < bounds.southwest.lng) {
+      lng = extraPercent * ((180.0 - bounds.southwest.lng) + (bounds.northeast.lng + 180));
     } else {
-      lng = extraPercent *
-          (bounds.northeast.longitude - bounds.southwest.longitude);
+      lng = extraPercent * (bounds.northeast.lng - bounds.southwest.lng);
     }
 
-    // Latitudes expanded beyond +/- 90 are automatically clamped by LatLng
-    double lat =
-        extraPercent * (bounds.northeast.latitude - bounds.southwest.latitude);
-
-    double eLng = (bounds.northeast.longitude + lng).clamp(-_maxLng, _maxLng);
-    double wLng = (bounds.southwest.longitude - lng).clamp(-_maxLng, _maxLng);
-
+    // lats expanded beyond +/- 90 are automatically clamped by LatLng
+    double lat = extraPercent * (bounds.northeast.lat - bounds.southwest.lat);
     return LatLngBounds(
-      southwest: LatLng(bounds.southwest.latitude - lat, wLng),
-      northeast:
-          LatLng(bounds.northeast.latitude + lat, lng != 0 ? eLng : _maxLng),
+      southwest: LatLng(bounds.southwest.lat - lat, bounds.southwest.lng - lng),
+      northeast: LatLng(bounds.northeast.lat + lat, bounds.northeast.lng + lng),
     );
   }
 
   int _findLevel(List<double> levels) {
     for (int i = levels.length - 1; i >= 0; i--) {
-      if (levels[i] <= _zoom) {
-        return i + 1;
-      }
+      if (levels[i] <= _currentZoom) return i + 1;
     }
 
     return 1;
   }
 
-  int _getZoomLevel(double zoom) {
-    for (int i = levels.length - 1; i >= 0; i--) {
-      if (levels[i] <= zoom) {
-        return levels[i].toInt();
-      }
-    }
-
-    return 1;
-  }
-
-  List<Cluster<T>> _computeClustersWithMaxDist(
-      List<T> inputItems, double zoom) {
-    MaxDistClustering<T> scanner = MaxDistClustering(
-      epsilon: maxDistParams?.epsilon ?? 20,
-    );
-
-    return scanner.run(inputItems, _getZoomLevel(zoom));
-  }
-
-  List<Cluster<T>> _computeClusters(
-      List<T> inputItems, List<Cluster<T>> markerItems,
-      {int level = 5}) {
+  List<Cluster<T>> _computeClusters(List<ClusterItem<T>> inputItems, List<Cluster<T>> markerItems, {int level = 5}) {
     if (inputItems.isEmpty) return markerItems;
+
     String nextGeohash = inputItems[0].geohash.substring(0, level);
 
-    List<T> items = inputItems
-        .where((p) => p.geohash.substring(0, level) == nextGeohash)
-        .toList();
+    List<ClusterItem<T>> items = inputItems.where((p) => p.geohash.substring(0, level) == nextGeohash).toList();
 
-    markerItems.add(Cluster<T>.fromItems(items));
+    markerItems.add(Cluster<T>(items));
 
-    List<T> newInputList = List.from(
-        inputItems.where((i) => i.geohash.substring(0, level) != nextGeohash));
+    List<ClusterItem<T>> newInputList =
+        List.from(inputItems.where((i) => i.geohash.substring(0, level) != nextGeohash));
 
     return _computeClusters(newInputList, markerItems, level: level);
   }
 
-  static Future<Marker> Function(Cluster) get _basicMarkerBuilder =>
-      (cluster) async {
+  static Future<Marker> Function(Cluster) get _basicMarkerBuilder => (cluster) async {
         return Marker(
           markerId: MarkerId(cluster.getId()),
           position: cluster.location,
-          onTap: () {
+          onClick: () {
             print(cluster);
           },
           icon: await _getBasicClusterBitmap(cluster.isMultiple ? 125 : 75,
@@ -228,8 +159,7 @@ class ClusterManager<T extends ClusterItem> {
         );
       };
 
-  static Future<BitmapDescriptor> _getBasicClusterBitmap(int size,
-      {String? text}) async {
+  static Future<BitmapDescriptor> _getBasicClusterBitmap(int size, {String? text}) async {
     final PictureRecorder pictureRecorder = PictureRecorder();
     final Canvas canvas = Canvas(pictureRecorder);
     final Paint paint1 = Paint()..color = Colors.red;
@@ -240,10 +170,7 @@ class ClusterManager<T extends ClusterItem> {
       TextPainter painter = TextPainter(textDirection: TextDirection.ltr);
       painter.text = TextSpan(
         text: text,
-        style: TextStyle(
-            fontSize: size / 3,
-            color: Colors.white,
-            fontWeight: FontWeight.normal),
+        style: TextStyle(fontSize: size / 3, color: Colors.white, fontWeight: FontWeight.normal),
       );
       painter.layout();
       painter.paint(

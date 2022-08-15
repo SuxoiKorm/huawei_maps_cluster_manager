@@ -1,10 +1,13 @@
-import 'package:google_maps_cluster_manager/google_maps_cluster_manager.dart';
-import 'package:google_maps_flutter_platform_interface/google_maps_flutter_platform_interface.dart';
+import 'package:huawei_map/map.dart';
 
-abstract class ClusterItem {
-  LatLng get location;
+import 'cluster_manager.dart';
+import 'geohash.dart';
 
-  String? _geohash;
-  String get geohash => _geohash ??=
-      Geohash.encode(location, codeLength: ClusterManager.precision);
+class ClusterItem<T> {
+  final LatLng location;
+  final String geohash;
+  final T? item;
+
+  ClusterItem(this.location, {this.item})
+      : geohash = Geohash.encode(location.lat, location.lng, codeLength: ClusterManager.precision);
 }
