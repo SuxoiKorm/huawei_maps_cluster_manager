@@ -3,7 +3,7 @@ import 'dart:ui';
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
-import 'package:huawei_map/map.dart';
+import 'package:huawei_map/huawei_map.dart';
 
 import 'cluster.dart';
 import 'cluster_item.dart';

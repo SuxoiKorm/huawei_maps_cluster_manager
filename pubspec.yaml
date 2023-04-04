@@ -10,7 +10,7 @@ dependencies:
   flutter:
     sdk: flutter
 
-  huawei_map: ^6.5.0+301
+  huawei_map: ^6.9.0+300
 
 dev_dependencies:
   flutter_test:

@@ -1,4 +1,4 @@
-import 'package:huawei_map/map.dart';
+import 'package:huawei_map/huawei_map.dart';
 
 import 'cluster_manager.dart';
 import 'geohash.dart';
